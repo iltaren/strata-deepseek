@@ -131,6 +131,29 @@ public:
         try_ready(sp);
         return sp.state.load(std::memory_order_acquire) == kReady && sp.layer == layer && sp.expert == e ? s : -1;
     }
+    /// find() and a pin taken under the lock: the slot cannot be given up until unpin(slot).  (nan-fix: the prompt path's
+    /// expert stream reads a found slot later, on its I/O threads - a bare find() let a swap or a guess take the slot first)
+    int find_pin(int layer, int e) {
+        if (layer < 0 || layer >= (int) where_.size()) return -1;
+        std::lock_guard<std::mutex> lk(mu_);
+        const int s = where_[(size_t) layer][(size_t) e];
+        if (s < 0) return -1;
+        Slot& sp = slots_[(size_t) s];
+        try_ready(sp);
+        if (sp.state.load(std::memory_order_acquire) != kReady || sp.layer != layer || sp.expert != e) return -1;
+        sp.pin++;
+        sp.tick = ++clock_;
+        return s;
+    }
+    void unpin(int s) {
+        if (s < 0) return;
+        std::lock_guard<std::mutex> lk(mu_);
+        if (slots_[(size_t) s].pin > 0) slots_[(size_t) s].pin--;
+    }
+    /// (nan-fix diagnostics) the slot's generation: +1 every time it is given to another expert or freed
+    uint32_t gen(int s) const { return slots_[(size_t) s].gen.load(std::memory_order_acquire); }
+    int holder_layer(int s) const { return slots_[(size_t) s].layer; }
+    int holder_expert(int s) const { return slots_[(size_t) s].expert; }
     const uint8_t* mat(int slot, int r) const { return slots_[(size_t) slot].base + geo_[(size_t) slots_[(size_t) slot].layer].tr[r]; }
     const uint8_t* blob(int slot) const { return slots_[(size_t) slot].base; }
     /// The device address of the slot's blob (0: the arena is not mapped for the GPU)
@@ -271,6 +294,7 @@ public:
             if (sp.prefetch) st_.prefetch_wasted.fetch_add(1, std::memory_order_relaxed);
             st_.evictions.fetch_add(1, std::memory_order_relaxed);
         }
+        sp.gen.fetch_add(1, std::memory_order_acq_rel);
         sp.layer = layer;
         sp.expert = e;
         sp.pin = 1;
@@ -296,6 +320,7 @@ public:
             sp.state.store(kReady, std::memory_order_release);
         } else {
             where_[(size_t) layer][(size_t) e] = -1;
+            sp.gen.fetch_add(1, std::memory_order_acq_rel);
             sp.layer = sp.expert = -1;
             sp.left.store(0, std::memory_order_release);
             sp.state.store(kFree, std::memory_order_release);
@@ -399,6 +424,7 @@ public:
                     where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
                     st_.evictions.fetch_add(1, std::memory_order_relaxed);
                 }
+                sp.gen.fetch_add(1, std::memory_order_acq_rel);
                 sp.layer = sp.expert = -1;
                 sp.prefetch = false;
                 sp.state.store(kFree, std::memory_order_release);
@@ -445,6 +471,7 @@ private:
         std::atomic<int> state{kFree}, left{0};
         std::atomic<bool> bad{false}, cancel{false};
         uint64_t tick = 0;
+        std::atomic<uint32_t> gen{0};   // (nan-fix) +1 each time the slot is given to another expert or freed
     };
 
     static int vis_hash(int layer, int e) { return (int) (((unsigned) layer * 2654435761u + (unsigned) e * 40503u) >> 7) % 100; }
@@ -470,6 +497,7 @@ private:
             if (sp.prefetch) st_.prefetch_wasted.fetch_add(1, std::memory_order_relaxed);
             st_.evictions.fetch_add(1, std::memory_order_relaxed);
         }
+        sp.gen.fetch_add(1, std::memory_order_acq_rel);
         sp.layer = layer;
         sp.expert = e;
         sp.pin = demand ? 1 : 0;
@@ -515,6 +543,7 @@ private:
         if (sp.state.load() != kLoading) return;
         if (sp.bad.load()) {
             where_[(size_t) sp.layer][(size_t) sp.expert] = -1;
+            sp.gen.fetch_add(1, std::memory_order_acq_rel);
             sp.layer = sp.expert = -1;
             sp.state.store(kFree, std::memory_order_release);
             sp.prefetch = false;

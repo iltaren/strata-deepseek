@@ -717,6 +717,7 @@ struct Chunk {
     int ring_n = 0;
     cudaStream_t cs = nullptr;
     cudaEvent_t filled[kParts] = {}, freed[kParts] = {};
+    std::vector<int> part_pins[kParts];   // (nan-fix) the store slots a part's batch pinned for its copies (until filled[part])
     // in place (file_experts): each streamed expert's file region read into pinned staging (ring_n slots of
     // stage_stride bytes, a part's slots free again once its `filled` copies are done) by the readers, in parallel,
     // and DMA'd from there - a copy from the files' pages goes through the driver's staging, one thread at ~1.3 GB/s
@@ -758,7 +759,11 @@ struct Chunk {
         int64_t after = -1;                            // (layer-major) the items up to this one read first
         std::atomic<int> left{0};                      // parts still being read
         std::atomic<bool> bad{false};
+        int st_slot = -1;                              // (nan-fix) its RAM-store slot when `ram` is one, else -1
+        uint32_t st_gen = 0;                           // (nan-fix) that slot's generation when it was found
+        bool st_pin = false;                           // (nan-fix) the slot is pinned for it until its copy is done
     };
+    uint64_t st_items = 0, st_stale_push = 0, st_stale_dma = 0;   // (nan-fix) store items; their slots changed hands
     bool flow = false;
     bool direct = false;                     // (Metal, unified memory) the flow reads the files straight into the ring
     int dev = -1;                            // the device (index into devs) this chunk state belongs to
@@ -1586,6 +1591,7 @@ struct Model::Impl {
     struct RcJob {
         int layer = 0, slot = 0, expert = 0;
         unsigned gen = 0;
+        int st_pin = -1;   // (nan-fix) the store slot pinned for the fill's copies (-1: none), given back once rc_ev says done
     };
     static constexpr int kRcUpd = 8192;
     std::vector<cudaStream_t> rc_cs;            // a device's copy stream for the fills
@@ -2479,15 +2485,28 @@ struct Model::Impl {
         }
         return true;
     }
-    const uint8_t* mx_mat(const Layer& l, int e, int r) const {   // expert e's matrix r: its RAM-tier slot, else the file's
+    // expert e's matrix r: its RAM-store slot, else its RAM-tier slot, else the file's.  (nan-fix) A store slot found here is
+    // NOT pinned: fine for a hint or a residency check, but nothing may copy the expert's bytes through this pointer later - a
+    // swap's put_begin, a guess or a CPU-lane miss can give the slot to another expert first.  A copy pins the slot
+    // (mx_pin) and reads it through mx_mat_at.
+    const uint8_t* mx_mat(const Layer& l, int e, int r) const {
         if (store) {
             const int s = store->find(l.il, e);
             if (s >= 0) return store->mat(s, r);
         }
+        return mx_mat_nostore(l, e, r);
+    }
+    const uint8_t* mx_mat_nostore(const Layer& l, int e, int r) const {   // its RAM-tier slot, else the file's - never the store
         if (!l.ram.empty() && l.ram[(size_t) e] >= 0)   // (a copy with NH > 1: part 0's rows only - whole: read_mx)
             return copy_mode ? ram_part[(size_t) l.ram[(size_t) e]][0] + cp_lay[(size_t) l.il][(size_t) r]
                              : ram_slots[(size_t) l.ram[(size_t) e]] + l.lay.trellis[r];
         return pk.at(l.mx_file[r], l.mx_off[r] + (uint64_t) e * l.mx_stride[r]);
+    }
+    // (nan-fix) the store slot of expert e pinned for a copy (unpin once the copy is done), or -1: then mx_mat_at reads the
+    // RAM tier or the file - not a store slot that arrived in between, unpinned
+    int mx_pin(const Layer& l, int e) const { return store && l.lay.fmt == gg::kFmtMXFP4 ? store->find_pin(l.il, e) : -1; }
+    const uint8_t* mx_mat_at(const Layer& l, int e, int r, int pinned) const {
+        return pinned >= 0 ? store->mat(pinned, r) : mx_mat_nostore(l, e, r);
     }
     size_t mx_part_bytes(const Layer& l, int r) const {   // (its type's)
         return r < 2 ? (size_t) g.ff * gg::type_row_bytes(gg::expert_type(l.lay, r), g.dim)
@@ -4308,11 +4327,13 @@ struct Model::Impl {
     // expert e of l (on the CPU lane: its NH column parts) -> member m's VRAM copy at dst, in the GPU layout (the full
     // blob, or a group member's part), by DMA from the pinned parts on the copy stream (in place: from `src`, its file
     // region read into pinned staging)
+    // (nan-fix) `pinned`: the caller's mx_pin(l, e) - the store slot it pinned for this copy, or -1 (none: the RAM tier or the
+    // file, never an unpinned store slot).  The copies are asynchronous: the caller unpins once they are done on `cs`.
     bool stream_expert(const Layer& l, int m, int e, uint8_t* dst, cudaStream_t cs, std::string& err,
-                       const uint8_t* src = nullptr) {
+                       const uint8_t* src, int pinned) {
         if (l.lay.fmt == gg::kFmtMXFP4) {   // the blob, or member m's rows / blocks: from `src` (the expert read into
             // pinned staging as its blob) or from the file's mapping
-            auto mat_r = [&](int r) { return src != nullptr ? src + l.lay.trellis[r] : mx_mat(l, e, r); };
+            auto mat_r = [&](int r) { return src != nullptr ? src + l.lay.trellis[r] : mx_mat_at(l, e, r, pinned); };
             bool ok = true;
             if (l.nm == 1) {
                 if (src != nullptr)
@@ -4500,6 +4521,11 @@ struct Model::Impl {
             for (int m = 0; m < l0.nm; ++m)
                 if (member(l0, m).dev == di) mi = m;
             if (S.cp >= (size_t) P) CK(cudaStreamWaitEvent(c.cs, c.freed[half], 0));
+            if (!c.part_pins[half].empty()) {   // (nan-fix) the part's last batch copied out of store slots: done by now, pins back
+                CK(cudaEventSynchronize(c.filled[half]));   // (as the staged path below already waits; no wait without pins)
+                for (const int s : c.part_pins[half]) store->unpin(s);
+                c.part_pins[half].clear();
+            }
             uint8_t* sb = nullptr;   // in place: the batch's regions in the part's staging slots
             if (c.stage != nullptr) {
                 const double t_evt = now_ms();
@@ -4535,8 +4561,11 @@ struct Model::Impl {
                     g_skip_count.copied.fetch_add(1, std::memory_order_relaxed);
                 }
                 uint8_t* dst = c.ring + ((size_t) half * (c.ring_n / P) + i) * c.ring_stride;
-                if (!stream_expert(l0, mi, l0.host_list[(size_t) (bt.j0 + i)], dst, c.cs, err,
-                                   sb != nullptr ? sb + (size_t) i * c.stage_stride : nullptr))
+                const int e = l0.host_list[(size_t) (bt.j0 + i)];
+                // (nan-fix) from the files' mapping (no staging): a store slot is read by the DMA later - pinned till filled[half]
+                const int pin = sb != nullptr ? -1 : mx_pin(l0, e);
+                if (pin >= 0) c.part_pins[half].push_back(pin);
+                if (!stream_expert(l0, mi, e, dst, c.cs, err, sb != nullptr ? sb + (size_t) i * c.stage_stride : nullptr, pin))
                     return false;
                 c.stream_bytes += (double) unit(member(l0, mi));
             }
@@ -4575,6 +4604,31 @@ struct Model::Impl {
             if (member(L0, m).dev == c.dev) return m;
         return 0;
     }
+    // (nan-fix) DS4_FLOW_PIN=0: the prompt path's store items unpinned, as upstream had them (to measure the race); default on
+    static bool flow_pin_on() {
+        static const bool on = !(std::getenv("DS4_FLOW_PIN") != nullptr && std::atoi(std::getenv("DS4_FLOW_PIN")) == 0);
+        return on;
+    }
+    // (nan-fix) a streamed expert's RAM-store slot was given to another expert (or freed) after the item found it: its copy
+    // read, or may have read, someone else's bytes.  Counted per chunk state; the first 40 said in the log.
+    void st_stale_note(Chunk& c, const Chunk::Item& it, const char* when) {
+        ++(when[0] == 'b' && when[1] == 'e' ? c.st_stale_push : c.st_stale_dma);
+        static std::atomic<int> said{0};
+        if (said.fetch_add(1) < 40)
+            std::fprintf(stderr, "ds4 nanfix: layer %d expert %d: its RAM-store slot %d changed hands %s (now layer %d expert %d)%s\n",
+                         it.il, it.e, it.st_slot, when, store->holder_layer(it.st_slot), store->holder_expert(it.st_slot),
+                         it.st_pin ? " - WHILE PINNED" : "");
+    }
+    // (nan-fix) every pin a chunk state's items still hold given back (items an aborted run never copied)
+    void flow_unpin_all(Chunk& c) {
+        if (!store) return;
+        for (Chunk::Item& it : c.items)
+            if (it.st_pin) {
+                store->unpin(it.st_slot);
+                it.st_pin = false;
+                it.st_slot = -1;
+            }
+    }
     void flow_push(Chunk& c, const Layer& l, int mi, int k, int e, int v) {
         c.items.emplace_back();
         Chunk::Item& it = c.items.back();
@@ -4586,10 +4640,18 @@ struct Model::Impl {
         bool in_ram = !l.ram.empty() && l.ram[(size_t) e] >= 0;
         const uint8_t* store_blob = nullptr;   // (the RAM store holds it: copied into staging like a RAM-tier slot, no read)
         if (!in_ram && store && l.nm == 1) {
-            const int ss = store->find(l.il, e);
+            // (nan-fix) the slot is read later by io, after the items before it: pinned now, so that a swap's put_begin or a
+            // guess cannot give it to another expert first (its blob then copied in place of this one - another layer's
+            // types decoded as this one's: NaN; DS4_FLOW_PIN=0: the old unpinned find, for A/B)
+            const bool pin = flow_pin_on();
+            const int ss = pin ? store->find_pin(l.il, e) : store->find(l.il, e);
             if (ss >= 0) {
                 store_blob = store->blob(ss);
                 in_ram = true;
+                it.st_slot = ss;
+                it.st_gen = store->gen(ss);
+                it.st_pin = pin;
+                ++c.st_items;
             }
         }
         if (in_ram && ram_pinned && store_blob == nullptr) {   // (DMA'd from where it lies)
@@ -4801,6 +4863,7 @@ struct Model::Impl {
                     j.map = pk.at(l.mx_file[q], j.off);
                     j.keep = it.keep != nullptr ? it.keep + lay.trellis[q] : nullptr;
                 }
+                if (it.st_slot >= 0 && store->gen(it.st_slot) != it.st_gen) st_stale_note(c, it, "before its copy");
                 c.io->push(jobs, nj);
             } else if (it.stage >= 0) {
                 const int64_t prev = c.stage_item[(size_t) it.stage];
@@ -4844,6 +4907,7 @@ struct Model::Impl {
                     j.keep = it.keep != nullptr ? it.keep + l.lay.trellis[r] : nullptr;
                     sb += flow_region(r);
                 }
+                if (it.st_slot >= 0 && store->gen(it.st_slot) != it.st_gen) st_stale_note(c, it, "before its copy");
                 c.io->push(jobs, nj);
             }
             ++c.n_read;
@@ -4863,6 +4927,12 @@ struct Model::Impl {
                 err = "reading layer " + std::to_string(it.il) + " expert " + std::to_string(it.e) +
                       " from the model's files failed";
                 return false;
+            }
+            if (it.st_slot >= 0) {   // (nan-fix: its copy out of the store slot is done - staging holds it now)
+                if (store->gen(it.st_slot) != it.st_gen) st_stale_note(c, it, "by its DMA");
+                if (it.st_pin) store->unpin(it.st_slot);
+                it.st_pin = false;
+                it.st_slot = -1;
             }
             const size_t r = c.n_dma % R;
             if (c.n_dma >= R) CK(cudaStreamWaitEvent(c.cs, c.ring_free[r], 0));
@@ -5263,7 +5333,10 @@ struct Model::Impl {
         if (l.vm[(size_t) e][0].raw != nullptr) return true;
         uint64_t a[3];
         for (int r = 0; r < 3; ++r) {
-            a[r] = ::strata::dsv41::metal_host::zc_map(mx_mat(l, e, r), mx_part_bytes(l, r));
+            // (nan-fix) the file's own pages, as said above: mx_mat could hand a RAM-store (or RAM-tier) slot, and this mapping
+            // stays - once that slot holds another expert, the GPU would compute this one with its bytes
+            const uint8_t* fp = pk.at(l.mx_file[r], l.mx_off[r] + (uint64_t) e * l.mx_stride[r]);
+            a[r] = fp != nullptr ? ::strata::dsv41::metal_host::zc_map(fp, mx_part_bytes(l, r)) : 0;
             if (a[r] == 0) return false;
         }
         for (int r = 0; r < 3; ++r) {
@@ -8763,8 +8836,16 @@ struct Model::Impl {
         for (Dev& d : devs) {
             cudaSetDevice(d.id);
             if (router_nonfinite_take(d.st)) {
-                static std::atomic<bool> said{false};
-                if (!said.exchange(true)) {
+                static std::atomic<int> said{0};   // (nan-fix: every time, numbered - upstream said it once a process)
+                {
+                    uint64_t sp = 0, sd = 0;
+                    for (const auto& cp : chunks)
+                        if (cp != nullptr) sp += cp->st_stale_push, sd += cp->st_stale_dma;
+                    std::fprintf(stderr, "ds4 nanfix: NaN event #%d on device %d (store slots changed hands so far: %llu before copy, "
+                                         "%llu by DMA; pinning %s)\n", said.load() + 1, d.id, (unsigned long long) sp,
+                                 (unsigned long long) sd, flow_pin_on() ? "on" : "OFF");
+                }
+                if (said.fetch_add(1) == 0) {
                     char where[32];   // (the same words on CUDA and HIP as before; the Metal engine has one GPU, named so)
 #if defined(STRATA_METAL)
                     std::snprintf(where, sizeof where, "the GPU");
@@ -8900,19 +8981,25 @@ struct Model::Impl {
                 if (quit.load()) return;
                 held.swap(rc_q);
             }
-            for (const RcJob& j : held) {
+            for (const RcJob& j0 : held) {
+                RcJob j = j0;
                 Layer& l = L[(size_t) j.layer];
                 // (a failed fill, Project Maya #646 handmade0octopus: the event still records - a member's copy may be
                 // partly under way - but the job never reaches fly, so nothing stores rc_done and the tick's
                 // rc_done != rc_gen check never publishes the slot: the expert routes over the RAM lane (correct,
                 // slower), and the slot retires (rc_fill keeps holding it out of the free list))
+                // (nan-fix) the copies below run on rc_cs after the tick's tables, later than this: a store slot they read is
+                // pinned now and given back once rc_ev says they are done - unpinned, a CPU-lane miss, a guess or a swap
+                // could give it to another expert first and the recent slot would hold that one's bytes
+                j.st_pin = mx_pin(l, j.expert);
                 bool ok = true;
                 for (int m = 0; m < l.nm; ++m) {
                     Layer& x = member(l, m);
                     const int di = x.dev;
                     cudaSetDevice(devs[(size_t) di].id);
                     cudaStreamWaitEvent(rc_cs[(size_t) di], rc_go[(size_t) di], 0);   // (after the tick's tables)
-                    if (!stream_expert(l, m, j.expert, sat(l, x, l.rc_base + j.slot, unit(x)), rc_cs[(size_t) di], err))
+                    if (!stream_expert(l, m, j.expert, sat(l, x, l.rc_base + j.slot, unit(x)), rc_cs[(size_t) di], err,
+                                       nullptr, j.st_pin))
                         ok = false;
                     cudaEventRecord(l.rc_ev[(size_t) j.slot * l.nm + m], rc_cs[(size_t) di]);
                 }
@@ -8921,6 +9008,13 @@ struct Model::Impl {
                 else {
                     std::fprintf(stderr, "ds4: recent-slot fill failed, slot left unmapped: layer %d expert %d slot %d: %s\n",
                                  l.il, j.expert, l.rc_base + j.slot, err.c_str());
+                    if (j.st_pin >= 0) {   // (nan-fix: a member's copy may be partly under way - its pin back once it is done)
+                        for (int m = 0; m < l.nm; ++m) {
+                            cudaSetDevice(devs[(size_t) member(l, m).dev].id);
+                            cudaEventSynchronize(l.rc_ev[(size_t) j.slot * l.nm + m]);
+                        }
+                        store->unpin(j.st_pin);
+                    }
                     rc_pending.fetch_sub(1);   // (nothing will store rc_done for it: rc_drain must not count it)
                 }
             }
@@ -8933,6 +9027,7 @@ struct Model::Impl {
                     done = cudaEventQuery(l.rc_ev[(size_t) j.slot * l.nm + m]) == cudaSuccess;
                 }
                 if (done) {
+                    if (j.st_pin >= 0) store->unpin(j.st_pin);   // (nan-fix: its copies are done)
                     rc_done[(size_t) (l.rc_off + j.slot)].store(j.gen, std::memory_order_release);
                     rc_pending.fetch_sub(1);
                     fly[i] = fly.back();
@@ -12040,9 +12135,21 @@ struct Model::Impl {
         const int D = g.dim, H = g.hc, nk = (int) run.T.size();
         Streamer S;
         const int B = std::max(1, c.ring_n / Chunk::kParts);
+        {   // (nan-fix) the batches' store pins an earlier run left (its last parts, or an error's way out): back once its copies are done
+            bool pins = false;
+            for (const auto& v : c.part_pins) pins = pins || !v.empty();
+            if (pins) {
+                CK(cudaStreamSynchronize(c.cs));
+                for (auto& v : c.part_pins) {
+                    for (const int s0 : v) store->unpin(s0);
+                    v.clear();
+                }
+            }
+        }
         if (c.flow) {   // (the flow decides its streams as the layers route; nothing planned here)
             CK(cudaStreamSynchronize(s));
             CK(cudaStreamSynchronize(c.cs));
+            flow_unpin_all(c);   // (nan-fix: an item an earlier run never copied - an error's way out - gives its pin back)
             c.items.clear();
             c.base = c.n_read = c.n_dma = c.n_comp = 0;
             c.n_file = 0;
@@ -13171,6 +13278,20 @@ struct Model::Impl {
             toks.resize((size_t) (pos + took));
             ctoks.resize((size_t) (pos + took));
             n_logits = 0;
+        }
+        {   // (nan-fix) the run's streamed store items and how many of their slots changed hands (every run with DS4_NANFIX_STATS=1,
+            //  else only when some did)
+            static const bool every = std::getenv("DS4_NANFIX_STATS") != nullptr;
+            uint64_t si = 0, sp = 0, sd = 0;
+            for (const auto& cp : chunks)
+                if (cp != nullptr) si += cp->st_items, sp += cp->st_stale_push, sd += cp->st_stale_dma;
+            static uint64_t last = 0;
+            if (every || sp + sd != last)
+                std::fprintf(stderr, "ds4 nanfix: %llu tokens read; store items %llu in all, slots that changed hands %llu before the "
+                                     "copy and %llu by the DMA (pinning %s)\n",
+                             (unsigned long long) took, (unsigned long long) si, (unsigned long long) sp,
+                             (unsigned long long) sd, flow_pin_on() ? "on" : "OFF");
+            last = sp + sd;
         }
         pos += took;
         st.tokens += took;

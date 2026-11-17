@@ -239,6 +239,12 @@ public:
     void checkpoint(int slot = 0);
     bool restore(int64_t limit);
     int64_t restorable(int64_t limit) const;
+    /// Right after verify(): cut the state back by n of the drafts it accepted - the ones a request did not hand out because
+    /// it stopped inside the block - so the state ends where the reply did and the reply sent back continues it.  False
+    /// (nothing changed) when there is no verified window to cut (a forward since, a reset or restore) or n is too many.
+    bool rewind(int n);
+    /// The lowest position rewind() can still cut the state back to (the start of the last verified window), -1: none.
+    int64_t rewind_floor() const;
     /// Checkpoint 1 also becomes the anchor (kept until a restore goes before it): the position before the end of the
     /// first prompt of a run that continued in place, where a re-rendered history (earlier reasoning dropped) splits.
     void pin();

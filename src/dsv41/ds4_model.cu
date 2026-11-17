@@ -7187,6 +7187,7 @@ struct Model::Impl {
     }
 
     void reset() {
+        v_ok = false;   // (rewind: nothing left to cut back)
         pos = 0;
         toks.clear();
         ctoks.clear();
@@ -7318,6 +7319,7 @@ struct Model::Impl {
     }
 
     bool restore(int64_t limit) {
+        v_ok = false;   // (rewind: the state is a checkpoint's now)
         const int b = best_check(limit);
         if (b < 0) return false;
         const Check& c = check_at(b);
@@ -11413,6 +11415,11 @@ struct Model::Impl {
         drafts_q = false;
         rollback(p0, T, m + 1);
         if (!seed_drafter(p0, m + 1, 0, err)) return false;
+        // (rewind: this window can still be cut further back - its backups are good until the next forward)
+        v_p0 = p0;
+        v_T = T;
+        v_keep = m + 1;
+        v_ok = true;
         accepted = m;
         st.drafts_offered += n;
         st.drafts_accepted += m;
@@ -11423,6 +11430,22 @@ struct Model::Impl {
         return true;
     }
 
+    // rewind (nan-fix branch): the last verified window cut back by n more of the positions it kept - the drafts verify()
+    // accepted that the request never handed out (a stop, the length limit or a STOP met inside the block).  Without it the
+    // state is past the reply, the next prompt (the reply sent back) does not continue it, and the engine goes back to the
+    // checkpoint at the prompt's end: the whole reply read again.  Only right after verify(): any forward ends it (v_ok).
+    int64_t v_p0 = 0;
+    int v_T = 0, v_keep = 0;
+    bool v_ok = false;
+    bool rewind(int n) {
+        if (n <= 0) return true;
+        if (!v_ok || n > v_keep || pos != v_p0 + v_keep) return false;
+        rollback(v_p0, v_T, v_keep - n);
+        v_keep -= n;
+        return true;
+    }
+    // the lowest position rewind() can cut the state back to (-1: none)
+    int64_t rewind_floor() const { return v_ok && pos == v_p0 + v_keep ? v_p0 : -1; }
     // a verified window keeps its first `keep` positions: the ring rows and the compressors' state of the rest undone
     // (the compressed KV and the index keys past them are written again when those positions come)
     void rollback(int64_t p0, int T, int keep) {
@@ -13478,6 +13501,7 @@ struct Model::Impl {
     }
 
     bool forward(const int* tk, int T, int logits_rows, std::string& err, int seed_rows = -1) {
+        v_ok = false;   // (rewind: a new window overwrites the last one's backups)
 #if defined(STRATA_METAL)
         struct BusyAll {   // DS4_BUSY_ALL: the GPU is held busy for the whole step (the host gaps between its bursts too)
             bool on;
@@ -15131,6 +15155,8 @@ void Model::mark(bool shared) { p_->mark(shared); }
 int Model::marks_cap() const { return Impl::marks_cap(); }
 size_t Model::check_bytes() const { return p_->check_bytes(); }
 bool Model::restore(int64_t limit) { return p_->restore(limit); }
+bool Model::rewind(int n) { return p_->rewind(n); }
+int64_t Model::rewind_floor() const { return p_->rewind_floor(); }
 void Model::pin() { p_->pin(); }
 std::vector<int64_t> Model::check_positions() const { return p_->check_positions(); }
 int64_t Model::restorable(int64_t limit) const { return p_->restorable(limit); }

@@ -1044,7 +1044,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             held.clear();
         }
         const auto& st = m.tokens();
-        const size_t n_state = st.size();
+        size_t n_state = st.size();
         size_t c = 0;
         while (c < n_state && c < r.ids.size() && st[c] == r.ids[c]) ++c;
         // the same tokens with another picture (or none) do not share the state from that picture's span on
@@ -1057,6 +1057,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if ((size_t) q.start < c && !same(held, q)) c = (size_t) q.start;
         for (const Pic& q : held)
             if ((size_t) q.start < c && !same(pics, q)) c = (size_t) q.start;
+        // (nan-fix branch) the prompt leaves the state inside the last verified window: the client kept fewer of a drafted
+        // block's tokens than this engine handed out (a thinking budget's STOP met a burst of accepted drafts - the rewind at
+        // the end of that request could not know how many the client would keep).  The state is cut back to the shared
+        // prefix and continued, instead of going back to the checkpoint at the last prompt's end and reading the reply again.
+        {
+            const int64_t rwf = m.rewind_floor();
+            if (rwf >= 0 && c < n_state && (int64_t) c >= rwf && c < r.ids.size()) {
+                const size_t was = n_state;
+                if (m.rewind((int) (was - c))) {
+                    n_state = c;
+                    static int said = 0;
+                    if (said++ < 20)
+                        std::fprintf(stderr, "ds4: the prompt kept %zu fewer of the last drafted block's tokens: state cut back %zu -> %zu\n",
+                                     was - c, was, c);
+                }
+            }
+        }
         size_t from = 0;
         bool took = false, continued = false;   // (continued: the conversation goes on - its anchor stays)
         // the conversation continues, reused in place - a conversation has to be in the model first: a fresh engine
@@ -1405,6 +1422,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             std::printf("%s\n", stat_text(t1, s_dec, io_dec, produced, d_off, d_acc).c_str());
         };
         bool nan_stop = false;
+        bool failed = false;   // (a sample or a round failed: the state is not cut back - see the rewind below)
         // test only: STRATA_TEST_NAN_STOP_AT=<n> takes the NaN stop (the same ERR, reset and state drop) once, on the n-th request
         // this engine serves, at its first poll.  Unset (or 0) it does nothing at all.
         static const long test_nan_at = [] { const char* v = std::getenv("STRATA_TEST_NAN_STOP_AT"); return v != nullptr ? std::atol(v) : 0L; }();
@@ -1428,6 +1446,7 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             if (tok < 0) {   // (a sample's CUDA error, printed by the sampler: no T -1 to the client; Project Maya #619)
                 std::fprintf(stderr, "ds4 serve: the sample failed\n");
                 finish = "cancel";
+                failed = true;
                 break;
             }
             std::printf("T %d\n", tok);
@@ -1453,6 +1472,8 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
                     if (gpu_fatal_text(err)) die_gpu_fatal(err);
                     std::fprintf(stderr, "ds4: %s\n", err.c_str());
                     finish = "cancel";
+                    failed = true;
+                    got.clear();
                     break;
                 }
                 d_off += off;
@@ -1465,8 +1486,23 @@ int serve(strata::ds4::Model& m, const std::string& eos_list, bool spec, float c
             got.pop_back();
         }
         if (dump_f != nullptr) std::fflush(dump_f);
-        // (a stop within accepted drafts leaves the state past it: the next prompt shares less with it, and goes back to
-        //  the checkpoint at this prompt's end)
+        // (nan-fix branch) a stop inside an accepted block - the reply's end, a STOP, the length limit - left drafts that
+        // verify() accepted but this request never handed out in the state: cut back, so the state ends where the reply did
+        // (as without drafts) and the reply sent back with the next prompt continues it.  Upstream left them: that prompt no
+        // longer continued the state, went back to the checkpoint at this prompt's end and read the whole reply again.
+        // How many: `got` holds the accepted drafts after `tok` plus the token after them (never fed); when the loop ended on
+        // an end / limit check `tok` was handed out but is in the state, on a STOP it was not handed out and is in the state
+        // too (or is that last token, then got is empty) - either way the positions to cut are got.size().
+        if (!nan_stop && !failed && !got.empty()) {
+            static int said = 0;
+            const int64_t p_was = m.pos();
+            const bool cut = m.rewind((int) got.size());
+            if (!cut || said < 20) {
+                ++said;
+                std::fprintf(stderr, "ds4: %s %zu drafted token(s) past the reply's end (state %lld -> %lld)\n",
+                             cut ? "rewound" : "could NOT rewind", got.size(), (long long) p_was, (long long) m.pos());
+            }
+        }
         stat_line();
         const double t2 = now_ms();
         // (a request that ended on an ERR line - the NaN stop above - is over with that line: a DONE after it would be read by the
